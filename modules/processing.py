@@ -11,9 +11,8 @@ import cv2
 from skimage import exposure
 
 import modules.sd_hijack
-from modules import devices, prompt_parser, masking
+from modules import devices, prompt_parser, masking, sd_samplers, lowvram
 from modules.sd_hijack import model_hijack
-from modules.sd_samplers import samplers, samplers_for_img2img
 from modules.shared import opts, cmd_opts, state
 import modules.shared as shared
 import modules.face_restoration
@@ -46,6 +45,12 @@ def apply_color_correction(correction, image):
 
     return image
 
+
+def get_correct_sampler(p):
+    if isinstance(p, modules.processing.StableDiffusionProcessingTxt2Img):
+        return sd_samplers.samplers
+    elif isinstance(p, modules.processing.StableDiffusionProcessingImg2Img):
+        return sd_samplers.samplers_for_img2img
 
 class StableDiffusionProcessing:
     def __init__(self, sd_model=None, outpath_samples=None, outpath_grids=None, prompt="", styles=None, seed=-1, subseed=-1, subseed_strength=0, seed_resize_from_h=-1, seed_resize_from_w=-1, seed_enable_extras=True, sampler_index=0, batch_size=1, n_iter=1, steps=50, cfg_scale=7.0, width=512, height=512, restore_faces=False, tiling=False, do_not_save_samples=False, do_not_save_grid=False, extra_generation_params=None, overlay_images=None, negative_prompt=None, eta=None):
@@ -110,7 +115,7 @@ class Processed:
         self.width = p.width
         self.height = p.height
         self.sampler_index = p.sampler_index
-        self.sampler = samplers[p.sampler_index].name
+        self.sampler = sd_samplers.samplers[p.sampler_index].name
         self.cfg_scale = p.cfg_scale
         self.steps = p.steps
         self.batch_size = p.batch_size
@@ -122,6 +127,9 @@ class Processed:
         self.denoising_strength = getattr(p, 'denoising_strength', None)
         self.extra_generation_params = p.extra_generation_params
         self.index_of_first_image = index_of_first_image
+        self.styles = p.styles
+        self.job_timestamp = state.job_timestamp
+        self.clip_skip = opts.CLIP_stop_at_last_layers
 
         self.eta = p.eta
         self.ddim_discretize = p.ddim_discretize
@@ -166,6 +174,9 @@ class Processed:
             "extra_generation_params": self.extra_generation_params,
             "index_of_first_image": self.index_of_first_image,
             "infotexts": self.infotexts,
+            "styles": self.styles,
+            "job_timestamp": self.job_timestamp,
+            "clip_skip": self.clip_skip,
         }
 
         return json.dumps(obj)
@@ -263,14 +274,18 @@ def fix_seed(p):
 def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments, iteration=0, position_in_batch=0):
     index = position_in_batch + iteration * p.batch_size
 
+    clip_skip = getattr(p, 'clip_skip', opts.CLIP_stop_at_last_layers)
+
     generation_params = {
         "Steps": p.steps,
-        "Sampler": samplers[p.sampler_index].name,
+        "Sampler": get_correct_sampler(p)[p.sampler_index].name,
         "CFG scale": p.cfg_scale,
         "Seed": all_seeds[index],
         "Face restoration": (opts.face_restoration_model if p.restore_faces else None),
         "Size": f"{p.width}x{p.height}",
         "Model hash": getattr(p, 'sd_model_hash', None if not opts.add_model_hash_to_info or not shared.sd_model.sd_model_hash else shared.sd_model.sd_model_hash),
+        "Model": (None if not opts.add_model_name_to_info or not shared.sd_model.sd_checkpoint_info.model_name else shared.sd_model.sd_checkpoint_info.model_name.replace(',', '').replace(':', '')),
+        "Hypernet": (None if shared.loaded_hypernetwork is None else shared.loaded_hypernetwork.name.replace(',', '').replace(':', '')),
         "Batch size": (None if p.batch_size < 2 else p.batch_size),
         "Batch pos": (None if p.batch_size < 2 else position_in_batch),
         "Variation seed": (None if p.subseed_strength == 0 else all_subseeds[index]),
@@ -278,6 +293,7 @@ def create_infotext(p, all_prompts, all_seeds, all_subseeds, comments, iteration
         "Seed resize from": (None if p.seed_resize_from_w == 0 or p.seed_resize_from_h == 0 else f"{p.seed_resize_from_w}x{p.seed_resize_from_h}"),
         "Denoising strength": getattr(p, 'denoising_strength', None),
         "Eta": (None if p.sampler is None or p.sampler.eta == p.sampler.default_eta else p.sampler.eta),
+        "Clip skip": None if clip_skip <= 1 else clip_skip,
     }
 
     generation_params.update(p.extra_generation_params)
@@ -309,6 +325,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
         os.makedirs(p.outpath_grids, exist_ok=True)
 
     modules.sd_hijack.model_hijack.apply_circular(p.tiling)
+    modules.sd_hijack.model_hijack.clear_comments()
 
     comments = {}
 
@@ -338,7 +355,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     infotexts = []
     output_images = []
 
-    with torch.no_grad():
+    with torch.no_grad(), p.sd_model.ema_scope():
         with devices.autocast():
             p.init(all_prompts, all_seeds, all_subseeds)
 
@@ -346,6 +363,9 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             state.job_count = p.n_iter
 
         for n in range(p.n_iter):
+            if state.skipped:
+                state.skipped = False
+            
             if state.interrupted:
                 break
 
@@ -360,7 +380,7 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             #c = p.sd_model.get_learned_conditioning(prompts)
             with devices.autocast():
                 uc = prompt_parser.get_learned_conditioning(shared.sd_model, len(prompts) * [p.negative_prompt], p.steps)
-                c = prompt_parser.get_learned_conditioning(shared.sd_model, prompts, p.steps)
+                c = prompt_parser.get_multicond_learned_conditioning(shared.sd_model, prompts, p.steps)
 
             if len(model_hijack.comments) > 0:
                 for comment in model_hijack.comments:
@@ -372,9 +392,9 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             with devices.autocast():
                 samples_ddim = p.sample(conditioning=c, unconditional_conditioning=uc, seeds=seeds, subseeds=subseeds, subseed_strength=p.subseed_strength)
 
-            if state.interrupted:
+            if state.interrupted or state.skipped:
 
-                # if we are interruped, sample returns just noise
+                # if we are interrupted, sample returns just noise
                 # use the image collected previously in sampler loop
                 samples_ddim = shared.state.current_latent
 
@@ -382,6 +402,13 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
             x_samples_ddim = p.sd_model.decode_first_stage(samples_ddim)
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+            del samples_ddim
+
+            if shared.cmd_opts.lowvram or shared.cmd_opts.medvram:
+                lowvram.send_everything_to_cpu()
+
+            devices.torch_gc()
 
             if opts.filter_nsfw:
                 import modules.safety as safety
@@ -424,8 +451,15 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
                 if opts.samples_save and not p.do_not_save_samples:
                     images.save_image(image, p.outpath_samples, "", seeds[i], prompts[i], opts.samples_format, info=infotext(n, i), p=p)
 
-                infotexts.append(infotext(n, i))
+                text = infotext(n, i)
+                infotexts.append(text)
+                if opts.enable_pnginfo:
+                    image.info["parameters"] = text
                 output_images.append(image)
+
+            del x_samples_ddim 
+
+            devices.torch_gc()
 
             state.nextjob()
 
@@ -437,7 +471,10 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
             grid = images.image_grid(output_images, p.batch_size)
 
             if opts.return_grid:
-                infotexts.insert(0, infotext())
+                text = infotext()
+                infotexts.insert(0, text)
+                if opts.enable_pnginfo:
+                    grid.info["parameters"] = text
                 output_images.insert(0, grid)
                 index_of_first_image = 1
 
@@ -478,7 +515,7 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
             self.firstphase_height_truncated = int(scale * self.height)
 
     def sample(self, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength):
-        self.sampler = samplers[self.sampler_index].constructor(self.sd_model)
+        self.sampler = sd_samplers.create_sampler_with_index(sd_samplers.samplers, self.sampler_index, self.sd_model)
 
         if not self.enable_hr:
             x = create_random_tensors([opt_C, self.height // opt_f, self.width // opt_f], seeds=seeds, subseeds=subseeds, subseed_strength=self.subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
@@ -521,7 +558,8 @@ class StableDiffusionProcessingTxt2Img(StableDiffusionProcessing):
 
         shared.state.nextjob()
 
-        self.sampler = samplers[self.sampler_index].constructor(self.sd_model)
+        self.sampler = sd_samplers.create_sampler_with_index(sd_samplers.samplers, self.sampler_index, self.sd_model)
+
         noise = create_random_tensors(samples.shape[1:], seeds=seeds, subseeds=subseeds, subseed_strength=subseed_strength, seed_resize_from_h=self.seed_resize_from_h, seed_resize_from_w=self.seed_resize_from_w, p=self)
 
         # GC now before running the next img2img to prevent running out of memory
@@ -556,7 +594,7 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
         self.nmask = None
 
     def init(self, all_prompts, all_seeds, all_subseeds):
-        self.sampler = samplers_for_img2img[self.sampler_index].constructor(self.sd_model)
+        self.sampler = sd_samplers.create_sampler_with_index(sd_samplers.samplers_for_img2img, self.sampler_index, self.sd_model)
         crop_region = None
 
         if self.image_mask is not None:
@@ -662,5 +700,8 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
         if self.mask is not None:
             samples = samples * self.nmask + self.init_latent * self.mask
+
+        del x
+        devices.torch_gc()
 
         return samples
